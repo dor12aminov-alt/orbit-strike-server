@@ -3,59 +3,99 @@ import threading
 import json
 import os
 
-# Render קובע את הפורט אוטומטית, ואם לא - נשתמש ב-10000 כגיבוי
+# הגדרות שרת
 PORT = int(os.environ.get("PORT", 10000))
-HOST = '0.0.0.0' # מקשיב לכל העולם
+HOST = '0.0.0.0'
+
+# מבנה הנתונים שלנו:
+# lobbies = { "room_id": { "players": { "addr1": {"x": 0, "y": 0, "hp": 100}, "addr2": {...} } } }
+lobbies = {}
+data_lock = threading.Lock()
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # מאפשר הפעלה מחדש מהירה
 try:
     server.bind((HOST, PORT))
 except socket.error as e:
-    print(str(e))
+    print(f"[ERROR] {e}")
 
 server.listen()
-print(f"[SERVER STARTED] Listening on global port {PORT}...")
-
-active_lobbies = {}
+print(f"[SERVER STARTED] Listening on port {PORT}...")
 
 def handle_client(conn, addr):
+    addr_str = str(addr)
+    current_lobby = None
     print(f"[NEW CONNECTION] {addr} connected.")
-    current_lobby_id = None
 
     while True:
         try:
             data = conn.recv(2048).decode('utf-8')
-            if not data:
-                break
+            if not data: break
 
             request = json.loads(data)
             action = request.get("action")
 
+            # 1. יצירת לובי
             if action == "create_lobby":
-                current_lobby_id = str(addr[1])
-                active_lobbies[current_lobby_id] = {
-                    "name": f"Room_{current_lobby_id}",
-                    "ping": "30ms",
-                    "players": "1/4",
-                    "status": "In Lobby"
-                }
-                conn.send(json.dumps({"status": "success", "lobby_id": current_lobby_id}).encode('utf-8'))
-                print(f"[LOBBY CREATED] {active_lobbies[current_lobby_id]['name']}")
+                lobby_id = str(addr[1]) # משתמש בפורט של השחקן בתור מזהה ייחודי
+                with data_lock:
+                    lobbies[lobby_id] = {"players": {}}
+                    current_lobby = lobby_id
+                conn.send(json.dumps({"status": "success", "lobby_id": lobby_id}).encode())
+                print(f"[LOBBY CREATED] ID: {lobby_id}")
 
-            elif action == "get_servers":
-                server_list = list(active_lobbies.values())
-                conn.send(json.dumps(server_list).encode('utf-8'))
+            # 2. הצטרפות ללובי
+            elif action == "join_lobby":
+                target_id = request.get("lobby_id")
+                with data_lock:
+                    if target_id in lobbies:
+                        current_lobby = target_id
+                        conn.send(json.dumps({"status": "success"}).encode())
+                    else:
+                        conn.send(json.dumps({"status": "error", "msg": "Lobby not found"}).encode())
 
-        except:
+            # 3. קבלת רשימת לוביז
+            elif action == "get_lobbies":
+                with data_lock:
+                    rooms = list(lobbies.keys())
+                    conn.send(json.dumps(rooms).encode())
+
+            # 4. סנכרון נתונים (הלב של המשחק)
+            elif action == "update":
+                lobby_id = request.get("lobby_id")
+                player_data = request.get("data")
+                
+                with data_lock:
+                    if lobby_id in lobbies:
+                        # עדכון הנתונים של השחקן הנוכחי
+                        lobbies[lobby_id]["players"][addr_str] = player_data
+                        
+                        # שליפת כל השחקנים האחרים בחדר
+                        other_players = [
+                            {"addr": a, "data": d} 
+                            for a, d in lobbies[lobby_id]["players"].items() 
+                            if a != addr_str
+                        ]
+                        conn.send(json.dumps({"players": other_players}).encode())
+
+        except Exception as e:
+            print(f"[ERROR] {e}")
             break
 
-    if current_lobby_id in active_lobbies:
-        print(f"[LOBBY CLOSED] {active_lobbies[current_lobby_id]['name']}")
-        del active_lobbies[current_lobby_id]
+    # ניקוי בזמן התנתקות
+    if current_lobby:
+        with data_lock:
+            if current_lobby in lobbies and addr_str in lobbies[current_lobby]["players"]:
+                del lobbies[current_lobby]["players"][addr_str]
+                # אם הלובי ריק, אפשר למחוק אותו
+                if not lobbies[current_lobby]["players"]:
+                    del lobbies[current_lobby]
+                    print(f"[LOBBY REMOVED] {current_lobby}")
 
     conn.close()
+    print(f"[DISCONNECTED] {addr}")
 
 while True:
     conn, addr = server.accept()
-    thread = threading.Thread(target=handle_client, args=(conn, addr))
+    thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
     thread.start()
